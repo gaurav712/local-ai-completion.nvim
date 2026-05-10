@@ -1,28 +1,33 @@
 local M = {}
 
-local _src         = debug.getinfo(1, "S").source:sub(2)
-local _plugin_root = vim.fn.fnamemodify(_src, ":h:h:h")
-
 M.cfg = {
-    complete_bin   = _plugin_root .. "/complete",
-    debounce_ms    = 300,
-    max_tokens     = 40,
-    temperature    = 0.2,
-    max_ctx_lines  = 40,
-    max_suffix     = 200,   -- chars after cursor sent to LLM + used for dedup
-    min_suggestion = 1,     -- reject suggestions shorter than this
-    max_suggestion = 200,   -- cap suggestion length
-    enabled        = true,
+    server_host        = "127.0.0.1",
+    server_port        = 8080,
+    debounce_ms        = 300,
+    request_timeout_ms = 5000,
+    max_tokens         = 40,
+    temperature        = 0.2,
+    max_ctx_lines      = 40,
+    max_suffix         = 200,
+    min_suggestion     = 1,
+    max_suggestion     = 200,
+    enabled            = true,
 }
 
-local ns   = vim.api.nvim_create_namespace("prediction")
-local tmr  = vim.loop.new_timer()
-local job  = nil
-local pend = nil   -- {buf, row, col, text}
+local ns      = vim.api.nvim_create_namespace("prediction")
+local tmr     = vim.loop.new_timer()
+local tmr_out = vim.loop.new_timer()
+local job     = nil
+local pend    = nil   -- {buf, row, col, text}
+local req_id  = 0     -- monotonic; incremented on every new request cycle
+
+local SYSTEM = "You are a code completion engine. "
+    .. "The user will provide code containing a <FILL_HERE> marker. "
+    .. "Output ONLY the code that replaces <FILL_HERE>, at most 1-3 lines. "
+    .. "Raw code only — no explanation, no markdown fences, no preamble."
 
 -- ── Phase 1: Context Extraction ─────────────────────────────────────────────
 
--- Returns text before cursor (what gets sent to the LLM).
 local function extract_prefix(buf, row, col)
     local start = math.max(0, row - M.cfg.max_ctx_lines)
     local lines = vim.api.nvim_buf_get_lines(buf, start, row + 1, false)
@@ -32,7 +37,6 @@ local function extract_prefix(buf, row, col)
     return table.concat(lines, "\n")
 end
 
--- Returns text after cursor (used only for deduplication, never sent to LLM).
 local function extract_suffix(buf, row, col)
     local line = (vim.api.nvim_buf_get_lines(buf, row, row + 1, false))[1] or ""
     local after_cursor = line:sub(col + 1)
@@ -48,9 +52,6 @@ end
 
 -- ── Phase 3: Suffix Deduplication ───────────────────────────────────────────
 
--- Strategy A: greedy longest exact match.
--- Finds the longest L such that generated[1..L] == suffix[1..L],
--- then returns generated[L+1..] (the part that isn't already there).
 local function dedup_exact(generated, suffix)
     if #suffix == 0 then return generated end
     local max_len = math.min(#generated, #suffix)
@@ -62,8 +63,6 @@ local function dedup_exact(generated, suffix)
     return generated
 end
 
--- Splits s into a list of {tok, end_byte} pairs.
--- Tokens are either word-runs ([%w_]+) or single non-word characters.
 local function tokenize(s)
     local tokens = {}
     local i = 1
@@ -82,9 +81,6 @@ local function tokenize(s)
     return tokens
 end
 
--- Strategy B: token-based match.
--- Finds the longest k such that gen_tokens[1..k] == suf_tokens[1..k],
--- then returns generated from after the k-th token's byte position.
 local function dedup_tokens(generated, suffix)
     if #suffix == 0 then return generated end
     local gen_tok = tokenize(generated)
@@ -101,7 +97,6 @@ local function dedup_tokens(generated, suffix)
     return generated:sub(gen_tok[k].pos + 1)
 end
 
--- Try exact match first; fall back to token match.
 local function dedup(generated, suffix)
     local after_exact = dedup_exact(generated, suffix)
     if after_exact ~= generated then return after_exact end
@@ -110,12 +105,10 @@ end
 
 -- ── Phase 3b: Fence Stripping ────────────────────────────────────────────────
 
--- The LLM sometimes wraps output in markdown code fences despite the system
--- prompt saying not to. Strip them before showing ghost text.
 local function strip_fences(text)
-    text = text:gsub("^```[^\n]*\n", "")   -- opening ```[lang]\n
-    text = text:gsub("\n```%s*$", "")       -- closing \n```
-    text = text:gsub("^```%s*$", "")        -- bare ``` if that's all that's left
+    text = text:gsub("^```[^\n]*\n", "")
+    text = text:gsub("\n```%s*$", "")
+    text = text:gsub("^```%s*$", "")
     return text
 end
 
@@ -124,11 +117,9 @@ end
 local function validate(text, prefix)
     if #text < M.cfg.min_suggestion then return nil end
     if text:match("^%s*$") then return nil end
-    -- Cap length.
     if #text > M.cfg.max_suggestion then
         text = text:sub(1, M.cfg.max_suggestion)
     end
-    -- Reject if prefix already ends with this exact text (repetition).
     if #text <= #prefix and prefix:sub(-#text) == text then return nil end
     return text
 end
@@ -155,64 +146,70 @@ end
 
 local function do_complete()
     if not M.cfg.enabled then return end
-    local mode = vim.api.nvim_get_mode().mode
-    if mode:sub(1, 1) ~= "i" then return end
+    if vim.api.nvim_get_mode().mode:sub(1, 1) ~= "i" then return end
     if vim.bo.buftype ~= "" then return end
+
+    -- kill any lingering job before reading fresh buffer state
+    if job then vim.fn.jobstop(job); job = nil end
+
+    local my_req = req_id   -- capture before any yield point
 
     local buf = vim.api.nvim_get_current_buf()
     local cur = vim.api.nvim_win_get_cursor(0)
-    local row = cur[1] - 1   -- 0-indexed
-    local col = cur[2]       -- 0-indexed byte offset
+    local row = cur[1] - 1
+    local col = cur[2]
 
-    -- Phase 1: extract prefix and suffix.
-    -- Both are sent to the LLM (FIM format); suffix is also kept for dedup.
     local prefix = extract_prefix(buf, row, col)
     local suffix = extract_suffix(buf, row, col)
     if #prefix < 5 then return end
 
-    -- Build FIM prompt: surround the cursor gap with a marker so the model
-    -- knows exactly what it must fill rather than blindly continuing.
     local fim_prompt = prefix .. "<FILL_HERE>" .. suffix
 
-    local tmpfile = os.tmpname()
-    local f = io.open(tmpfile, "w")
-    if not f then return end
-    f:write(fim_prompt)
-    f:close()
+    local body = vim.json.encode({
+        model       = "local",
+        messages    = {
+            { role = "system", content = SYSTEM },
+            { role = "user",   content = fim_prompt },
+        },
+        max_tokens  = M.cfg.max_tokens,
+        temperature = M.cfg.temperature,
+        stop        = { "\n\n" },
+    })
+
+    local url = string.format("http://%s:%d/v1/chat/completions",
+        M.cfg.server_host, M.cfg.server_port)
 
     local chunks = {}
-
     job = vim.fn.jobstart(
-        { M.cfg.complete_bin, "-f", tmpfile,
-          "-n", tostring(M.cfg.max_tokens),
-          "-t", tostring(M.cfg.temperature) },
+        { "curl", "-s", "-X", "POST", url,
+          "-H", "Content-Type: application/json",
+          "--data", "@-",
+          "--max-time", tostring(math.ceil(M.cfg.request_timeout_ms / 1000)) },
         {
-            on_stdout = function(_, data)
-                vim.list_extend(chunks, data)
-            end,
-            on_exit = function(_, code)
+            stdin     = "pipe",
+            on_stdout = function(_, data) vim.list_extend(chunks, data) end,
+            on_exit   = function(_, code)
+                if req_id ~= my_req then return end   -- newer request fired; discard
                 job = nil
-                os.remove(tmpfile)
+                tmr_out:stop()
                 if code ~= 0 then return end
 
-                -- Strip trailing empty lines that jobstart appends.
-                while #chunks > 0 and chunks[#chunks] == "" do
-                    chunks[#chunks] = nil
-                end
-                local generated = table.concat(chunks, "\n")
-                if #generated == 0 then return end
+                local raw = table.concat(chunks, "\n")
+                if #raw == 0 then return end
 
-                -- Phase 3: deduplicate against suffix.
-                local deduped = dedup(generated, suffix)
+                local ok, decoded = pcall(vim.json.decode, raw)
+                if not ok then return end
 
-                -- Phase 3b: strip markdown code fences the model left in.
-                deduped = strip_fences(deduped)
+                local content = vim.tbl_get(decoded, "choices", 1, "message", "content")
+                if type(content) ~= "string" or #content == 0 then return end
 
-                -- Phase 4: validate.
+                local deduped    = dedup(content, suffix)
+                deduped          = strip_fences(deduped)
                 local suggestion = validate(deduped, prefix)
                 if not suggestion then return end
 
                 vim.schedule(function()
+                    if req_id ~= my_req then return end
                     if not M.cfg.enabled then return end
                     if vim.api.nvim_get_mode().mode:sub(1, 1) ~= "i" then return end
                     if vim.api.nvim_get_current_buf() ~= buf then return end
@@ -221,28 +218,19 @@ local function do_complete()
                     local now_row = now[1] - 1
                     local now_col = now[2]
 
-                    -- Row changed (Enter pressed, etc.) → stale.
                     if now_row ~= row then return end
 
                     local display_text = suggestion
-                    local display_col  = now_col   -- always anchor to current cursor
+                    local display_col  = now_col
 
-                    -- Step 1: cursor moved since trigger.
                     if now_col ~= col then
-                        if now_col < col then return end  -- deleted backward → stale
-
-                        -- User typed forward: valid only if typed chars match suggestion.
+                        if now_col < col then return end
                         local cur_line = vim.api.nvim_get_current_line()
                         local typed    = cur_line:sub(col + 1, now_col)
-                        if display_text:sub(1, #typed) ~= typed then
-                            return  -- diverged → discard
-                        end
+                        if display_text:sub(1, #typed) ~= typed then return end
                         display_text = display_text:sub(#typed + 1)
                     end
 
-                    -- Step 2: strip any echo of already-typed text at the suggestion
-                    -- head. Models often repeat the last few chars before the cursor
-                    -- (e.g. suggestion="def function_name" when line ends with "def fun").
                     local before_cur = vim.api.nvim_get_current_line():sub(1, display_col)
                     for L = math.min(#display_text, #before_cur), 1, -1 do
                         if display_text:sub(1, L) == before_cur:sub(-L) then
@@ -251,43 +239,53 @@ local function do_complete()
                         end
                     end
 
-                    -- Re-validate after both trims.
                     display_text = validate(display_text, prefix)
                     if not display_text then return end
-
                     show_ghost(buf, now_row, display_col, display_text)
                 end)
             end,
         }
     )
+
+    vim.fn.chansend(job, body)
+    vim.fn.chanclose(job, "stdin")
+
+    -- Lua-side timeout (curl --max-time handles the network layer; this covers edge cases)
+    tmr_out:stop()
+    tmr_out:start(M.cfg.request_timeout_ms, 0, vim.schedule_wrap(function()
+        if req_id == my_req and job ~= nil then
+            vim.fn.jobstop(job)
+            job = nil
+        end
+    end))
 end
 
 -- ── Event Handlers ───────────────────────────────────────────────────────────
 
 local function on_changed()
     tmr:stop()
-    if job then
-        vim.fn.jobstop(job)
-        job = nil
-    end
+    tmr_out:stop()
+    if job then vim.fn.jobstop(job); job = nil end
+    req_id = req_id + 1
+    local cur_req = req_id
     local buf = vim.api.nvim_get_current_buf()
     vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
     pend = nil
-    tmr:start(M.cfg.debounce_ms, 0, vim.schedule_wrap(do_complete))
+    tmr:start(M.cfg.debounce_ms, 0, vim.schedule_wrap(function()
+        if req_id == cur_req then do_complete() end
+    end))
 end
 
 local function on_leave()
     tmr:stop()
-    if job then
-        vim.fn.jobstop(job)
-        job = nil
-    end
+    tmr_out:stop()
+    if job then vim.fn.jobstop(job); job = nil end
+    req_id = req_id + 1
     local buf = vim.api.nvim_get_current_buf()
     vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
     pend = nil
 end
 
--- Returns "" when accepting ghost text; falls through to blink.cmp otherwise.
 local function tab_handler()
     if pend and vim.api.nvim_get_current_buf() == pend.buf then
         local cur = vim.api.nvim_win_get_cursor(0)
@@ -340,7 +338,6 @@ function M.setup(opts)
         callback = on_leave,
     })
 
-    -- expr=true, noremap=false: returned <Tab> falls through to blink.cmp.
     vim.keymap.set("i", "<Tab>", tab_handler,
         { expr = true, noremap = false, silent = true })
 
