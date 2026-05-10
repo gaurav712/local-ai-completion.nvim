@@ -15,9 +15,4 @@ test: complete test_runner
 clean:
 	rm -f complete test_runner /tmp/cc_test_*.in /tmp/cc_test_*.out
 
-.PHONY: all test clean install-nvim
-
-install-nvim:
-	@echo "Add to ~/.config/nvim/init.lua:"
-	@echo '  vim.opt.rtp:prepend("/Users/gaurav/Projects/prediction/nvim")'
-	@echo '  require("prediction").setup()'
+.PHONY: all test clean

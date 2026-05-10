@@ -1,7 +1,10 @@
 local M = {}
 
+local _src         = debug.getinfo(1, "S").source:sub(2)
+local _plugin_root = vim.fn.fnamemodify(_src, ":h:h:h")
+
 M.cfg = {
-    complete_bin   = "/Users/gaurav/Projects/prediction/complete",
+    complete_bin   = _plugin_root .. "/complete",
     debounce_ms    = 300,
     max_tokens     = 40,
     temperature    = 0.2,
